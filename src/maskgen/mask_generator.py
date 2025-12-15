@@ -230,14 +230,31 @@ class MaskGenerator:
 
         # convert 0/1 to 0/255
         mask = mask * 255
-        return Image.fromarray(mask, mode="L")
+        return Image.fromarray(mask)
 
 
     def _infer_whole(
         self, tensor: torch.Tensor
     ) -> torch.Tensor:
-        """Run single forward pass (for small images or downsampled)."""
-        ...
+        """
+        Run single forward pass on entire image. 
+        WARNING: for large images (the size you would expect from a reactor) this will need A LOT OF vRAM.
+        In general, avoid whole image inference unless on NVIDIA A100 80G or larger gpus.
+
+        Args:
+            tensor: Preprocessed input, shape (1, 3, H, W). Must already be
+                    padded to multiple of STRIDE_FACTOR.
+
+        Returns:
+            Logits tensor of shape (1, 1, H, W).
+        """
+        self._validate_inference_input(tensor)
+
+        with torch.no_grad():
+            output = self.model(tensor)
+            
+        return output
+
 
     def _infer_tiled(
         self, tensor: torch.Tensor,
@@ -246,8 +263,53 @@ class MaskGenerator:
     ) -> torch.Tensor:
         """
         Tile-based inference with overlap-blending.
-        
-        Uses linear ramp weights at tile boundaries for smooth stitching.
+
+        For large images that don't fit in memory, this method splits the image
+        into overlapping tiles, runs inference on each, and blends the results.
+        This trades speed for memory efficiency.
+
+        Args:
+            tensor: Preprocessed input, shape (1, 3, H, W). Does NOT need to be
+                    pre-padded; each tile is padded individually.
+            tile_size: Size of each square tile in pixels. Must be divisible by
+                    STRIDE_FACTOR (32). Larger tiles = faster but more memory.
+                    Recommended: 512 for ~4GB VRAM, 256 for CPU.
+            overlap: Overlap between adjacent tiles in pixels. Larger overlap
+                    reduces seam artifacts but increases computation.
+                    Recommended: 64-128 pixels.
+
+        Returns:
+            Logits tensor of shape (1, 1, H, W), same spatial size as input.
+
+        Algorithm:
+            1. Calculate tile grid positions with overlap
+            2. For each tile position:
+            a. Extract tile from input
+            b. Pad tile to multiple of 32 (if needed)
+            c. Run inference
+            d. Unpad result
+            e. Accumulate into output buffer with blending weights
+            3. Normalize by total weight at each pixel
+
+        Blending strategy:
+            Uses linear ramp weights at tile edges. Each pixel's final value is
+            a weighted average of all tiles that cover it:
+
+            Tile A:  [1.0  1.0  1.0  0.75 0.5  0.25 0.0]  (fades out)
+            Tile B:            [0.0  0.25 0.5  0.75 1.0  1.0  1.0]  (fades in)
+                            └─── overlap region ───┘
+
+            This eliminates hard seams between tiles.
+
+        Memory usage:
+            Only one tile is in GPU memory at a time. Output buffer is kept on
+            CPU and assembled incrementally.
+
+        Example:
+            >>> tensor = torch.randn(1, 3, 4000, 6000)  # Large image
+            >>> logits = self._infer_tiled(tensor, tile_size=512, overlap=64)
+            >>> logits.shape
+            torch.Size([1, 1, 4000, 6000])
         """
         ...
 
@@ -255,7 +317,36 @@ class MaskGenerator:
         self, tensor: torch.Tensor,
         max_dim: int,
     ) -> torch.Tensor:
-        """Downsample -> infer -> upsample strategy."""
+        """
+        Downsample-infer-upsample strategy for memory-constrained inference.
+
+        Alternative to tiling: shrink the image to fit in memory, run inference,
+        then upscale the result. Faster than tiling but may lose fine details.
+
+        Args:
+            tensor: Preprocessed input, shape (1, 3, H, W).
+            max_dim: Maximum allowed dimension (height or width). Image is scaled
+                    so its largest dimension equals max_dim, preserving aspect ratio.
+                    Recommended: 1024-2048 depending on available memory.
+
+        Returns:
+            Logits tensor of shape (1, 1, H, W), upscaled to original input size.
+
+        Trade-offs vs tiling:
+            Pros:
+                - Much faster (single forward pass)
+                - No blending artifacts
+            Cons:
+                - Loses fine details at high downscale ratios
+                - Small objects may disappear entirely
+
+        Example:
+            >>> tensor = torch.randn(1, 3, 4000, 6000)  # 24MP image
+            >>> logits = self._infer_downsampled(tensor, max_dim=1024)
+            # Internally: 4000x6000 -> 683x1024 -> infer -> 4000x6000
+            >>> logits.shape
+            torch.Size([1, 1, 4000, 6000])
+        """
         ...
 
     @staticmethod
@@ -306,7 +397,7 @@ class MaskGenerator:
 
         # F.pad format: (left, right, top, bottom) — last dim first!
         pad_spec = (0, pad_right, 0, pad_bottom)
-        #           └─ width ─┘   └─ height ─┘
+
         padded = F.pad(tensor, pad_spec, mode='constant', value=0)
         return padded, pad_spec
 
@@ -354,3 +445,54 @@ class MaskGenerator:
         ]
 
         return tensor
+    
+    def _validate_inference_input(
+        self, tensor: torch.Tensor
+    ) -> None:
+        """
+        Sanity checks before running inference.
+
+        Validates that the input tensor and model are properly configured
+        for inference. Raises descriptive errors for common mistakes.
+
+        Args:
+            tensor: Preprocessed input tensor to validate.
+
+        Raises:
+            RuntimeError: If tensor is not on self.device.
+            RuntimeError: If model is not on self.device.
+            RuntimeError: If model is in training mode.
+            ValueError: If tensor has wrong shape (not 4D).
+            ValueError: If tensor has wrong number of channels (not 3).
+        """
+
+        # Tensor device check
+        if tensor.device != self.device:
+            raise RuntimeError(
+                f"Tensor is on {tensor.device}, expected {self.device}."
+            )
+
+        # Model device check
+        model_device = next(self.model.parameters()).device
+        if model_device != self.device:
+            raise RuntimeError(
+                f"Model is on {model_device}, expected {self.device}."
+            )
+
+        # Model mode check
+        if self.model.training:
+            raise RuntimeError(
+                "Model is in training mode. Call model.eval() first."
+            )
+
+        # Shape check
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"Expected 4D tensor (N, C, H, W), got {tensor.dim()}D."
+            )
+
+        # Channel check
+        if tensor.shape[1] != 3:
+            raise ValueError(
+                f"Expected 3 input channels, got {tensor.shape[1]}."
+            )
