@@ -11,7 +11,7 @@ from torchvision import tv_tensors
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
-from utils import list_dir
+from .utils import list_dir
 
 class ImageData(Dataset):
     @staticmethod
@@ -28,7 +28,16 @@ class ImageData(Dataset):
         ])
         return geom, norm
     
-    def __init__(self, root, partiton, transform, config) -> None:
+    def __init__(self, root:str, partiton:str, transform:bool, config:dict) -> None:
+        '''
+        Custom dataset class for image and mask data
+
+        Args:
+        root(str): root dir of data
+        partition(str): train/val/test data
+        transform(bool): whether to perform transform
+        config(dict): config dict
+        '''
         self.crops_per_img = config['crop_per_img']
         self.geom, self.norm = self.create_transforms(config["img_size"])
         self.transform = transform
@@ -61,11 +70,11 @@ class ImageData(Dataset):
     def __getitem__(self, index):
         raw_idx = index // self.crops_per_img
 
-        img = self.images[raw_idx]
+        img = self.images[raw_idx][:3]
         mask = self.masks[raw_idx]
 
         if self.transform:
-            out = self.geom({'image': img, 'mask':mask})
+            out = self.geom({'image': img, 'mask': mask})
             img_crop, mask_crop = out["image"], out["mask"]
         else:
             img_crop, mask_crop = img, mask
@@ -73,12 +82,11 @@ class ImageData(Dataset):
         img_crop = T.ToDtype(torch.float32, scale=True)(img_crop)
         img_crop = self.norm(img_crop)
 
-        # apparaently mask only need one channel
-        if mask_crop.ndim == 3 and mask_crop.shape[0] > 1:
-            mask_crop = mask_crop.amax(dim=0, keepdim=True)   
-        elif mask_crop.ndim == 2:
-            mask_crop = mask_crop.unsqueeze(0)
+        # i do not fully understand how the lines below work but the appear to work
 
-        mask_crop = (mask_crop > 0).to(torch.float32)
+        # mask: RGBA/RGB -> 1ch binary (white dots = 1)
+        mc = (mask_crop[:3] if mask_crop.ndim == 3 else mask_crop).amax(dim=0, keepdim=True)  # [1,H,W]
+        mask_crop = (mc > 127).to(torch.float32)  # swap to <128 if your foreground is dark
+
 
         return img_crop, mask_crop     
