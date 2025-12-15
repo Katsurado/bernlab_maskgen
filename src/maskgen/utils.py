@@ -54,8 +54,8 @@ def save_model(model, ema_model, optimizer, scheduler, metrics, epoch, path):
          path)
     
 
-def load_model(model, ema_model, optimizer=None, scheduler=None, path='./checkpoint.pth'):
-    checkpoint = torch.load(path, weights_only=False)
+def load_model(model, ema_model, device, optimizer=None, scheduler=None, path='./checkpoint.pth'):
+    checkpoint = torch.load(path, weights_only=False, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     ema_model.load_state_dict(checkpoint['ema_model'])
     if optimizer is not None:

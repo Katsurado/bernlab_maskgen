@@ -61,15 +61,14 @@ class MaskGenerator:
         self.config:dict = self.DEFAULT_CONFIG if config is None else config
         self.device:torch.device = self._resolve_device(device)
         self._load_checkpoint(checkpoint_path, use_ema)
-        self.model.to(self.device)  # move weights to correct device
+        self.model.to(self.device, memory_format=torch.channels_last)  # move weights to correct device
+        self.device = next(self.model.parameters()).device
         self.model.eval()            # disable dropout, stochastic depth, etc.
 
     def generate(
         self,
         image: Union[str, Path, Image.Image, np.ndarray],
-        strategy: Literal["tile", "downsample"] = "tile",
-        tile_size: int = 512,
-        tile_overlap: int = 64,
+        strategy: Union[dict, None] = None,
         threshold: float = 0.5,
         return_prob: bool = False,
     ) -> Union[Image.Image, np.ndarray]:
@@ -78,19 +77,43 @@ class MaskGenerator:
 
         Args:
             image: Input RGB image (path, PIL Image, or HWC uint8 array).
-            strategy: 
-                "tile" - process in overlapping patches, blend results.
-                "downsample" - resize to fit memory, then upscale mask.
-            tile_size: Patch size for tiling (must be divisible by 32).
-            tile_overlap: Overlap between tiles for blending.
+            strategy: Inference strategy config. Dict with 'name' key and strategy-specific params.
+                - {"name": "whole"} 
+                    No processing, infer on original image. Requires lots of VRAM.
+                - {"name": "tile", "tile_size": 512, "overlap": 64}
+                    Process in overlapping patches, blend results.
+                - {"name": "downsample", "max_dim": 1024}
+                    Resize to fit memory, then upscale mask.
+                Default: {"name": "whole"}
             threshold: Probability cutoff for binary mask.
             return_prob: If True, return float32 probability map instead of binary.
 
         Returns:
             Binary mask as PIL Image (mode "L"), or float32 ndarray if return_prob=True.
         """
-        ...
+        if strategy is None:
+            strategy = {"name": "whole"}
+        
+        name = strategy['name']
 
+        tensor = self._preprocess(image)
+        
+        if name == "whole":
+            logits = self._infer_whole(tensor)
+        elif name == "tile":
+            tile_size = strategy.get("tile_size", 512)
+            overlap = strategy.get("overlap", 64)
+            logits = self._infer_tiled(tensor, tile_size, overlap)
+        elif name == "downsample":
+            max_dim = strategy.get("max_dim", 1024)
+            logits = self._infer_downsampled(tensor, max_dim)
+        else:
+            raise ValueError(f"Unknown strategy: {name}")
+        
+        mask = self._postprocess(logits, threshold, return_prob)
+
+        return mask
+    
     # ──────────────────────────────────────────────────────────────
     # Private helpers
     # ──────────────────────────────────────────────────────────────
@@ -102,11 +125,13 @@ class MaskGenerator:
         config = self.config
 
         model = Net(self.config['channels'], self.config)
+        model = torch.compile(model)
+
         ema_model = swa.AveragedModel(
             model, multi_avg_fn=swa.get_ema_multi_avg_fn(self.config['ema'])
         )
 
-        model, ema_model, _, _, _, _ = load_model(model,ema_model, path=path)
+        model, ema_model, _, _, _, _ = load_model(model, ema_model, self.device, path=path)
 
         if use_ema:
             self.model = ema_model
@@ -238,22 +263,25 @@ class MaskGenerator:
     ) -> torch.Tensor:
         """
         Run single forward pass on entire image. 
-        WARNING: for large images (the size you would expect from a reactor) this will need A LOT OF vRAM.
-        In general, avoid whole image inference unless on NVIDIA A100 80G or larger gpus.
+        
+        WARNING: For large images this will need A LOT of VRAM.
+        In general, avoid whole image inference unless on NVIDIA A100 80G or larger GPUs.
 
         Args:
-            tensor: Preprocessed input, shape (1, 3, H, W). Must already be
-                    padded to multiple of STRIDE_FACTOR.
+            tensor: Preprocessed input, shape (1, 3, H, W).
 
         Returns:
-            Logits tensor of shape (1, 1, H, W).
+            Logits tensor of shape (1, 1, H, W), same size as input.
         """
         self._validate_inference_input(tensor)
+        padded, pad_spec = self._pad_to_multiple(tensor, self.STRIDE_FACTOR)
 
         with torch.no_grad():
-            output = self.model(tensor)
+            logits_padded = self.model(padded)
+
+        logits = self._unpad(logits_padded, pad_spec)
             
-        return output
+        return logits
 
 
     def _infer_tiled(
@@ -311,7 +339,7 @@ class MaskGenerator:
             >>> logits.shape
             torch.Size([1, 1, 4000, 6000])
         """
-        ...
+        raise NotImplementedError
 
     def _infer_downsampled(
         self, tensor: torch.Tensor,
@@ -347,7 +375,7 @@ class MaskGenerator:
             >>> logits.shape
             torch.Size([1, 1, 4000, 6000])
         """
-        ...
+        raise NotImplementedError
 
     @staticmethod
     def _pad_to_multiple(
