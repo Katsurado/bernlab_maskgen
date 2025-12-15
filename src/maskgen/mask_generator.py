@@ -11,8 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import math
+import torch._dynamo
 import torch.nn.functional as F
 import torch.optim.swa_utils as swa
+
 
 from PIL import Image
 
@@ -60,9 +62,16 @@ class MaskGenerator:
         """
         self.config:dict = self.DEFAULT_CONFIG if config is None else config
         self.device:torch.device = self._resolve_device(device)
+
+        # MPS + torch.compile has bugs with certain tensor sizes
+        # Disable dynamo to avoid InductorError on large images 
+        if self.device.type == "mps":
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.disable()
+
         self._load_checkpoint(checkpoint_path, use_ema)
         self.model.to(self.device, memory_format=torch.channels_last)  # move weights to correct device
-        self.device = next(self.model.parameters()).device
+        self.device = next(self.model.parameters()).device # move it to actual device i.e. mps0 instead of mps
         self.model.eval()            # disable dropout, stochastic depth, etc.
 
     def generate(
@@ -122,8 +131,6 @@ class MaskGenerator:
         self, path: str, use_ema: bool
     ) -> None:
         """Load model architecture and weights from checkpoint."""
-        config = self.config
-
         model = Net(self.config['channels'], self.config)
         model = torch.compile(model)
 
@@ -250,7 +257,7 @@ class MaskGenerator:
         if return_prob:
             return probs
         
-        # apply a threashold
+        # apply a threshold
         mask = (probs >= threshold).astype(np.uint8)
 
         # convert 0/1 to 0/255
@@ -274,6 +281,7 @@ class MaskGenerator:
             Logits tensor of shape (1, 1, H, W), same size as input.
         """
         self._validate_inference_input(tensor)
+
         padded, pad_spec = self._pad_to_multiple(tensor, self.STRIDE_FACTOR)
 
         with torch.no_grad():
@@ -375,7 +383,26 @@ class MaskGenerator:
             >>> logits.shape
             torch.Size([1, 1, 4000, 6000])
         """
-        raise NotImplementedError
+        _, _, h, w = tensor.shape
+        original_size = (h, w)
+
+        scale = max_dim / max(h, w)
+    
+        if scale >= 1.0:
+            return self._infer_whole(tensor)
+        
+        # Downsample
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        small = F.interpolate(tensor.cpu(), size=(new_h, new_w), mode='bilinear', align_corners=False).to(self.device)
+
+        # Infer (pad/unpad handled inside)
+        logits_small = self._infer_whole(small)
+
+        # Upsample back to original size
+        logits = F.interpolate(logits_small, size=original_size, mode='bilinear', align_corners=False)
+    
+        return logits   
 
     @staticmethod
     def _pad_to_multiple(
