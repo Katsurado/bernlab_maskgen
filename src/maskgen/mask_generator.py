@@ -416,6 +416,7 @@ class MaskGenerator:
         h_weights = np.ones((tile_h, ))
         w_weights = np.ones((tile_w, ))
         
+        # tile_size / 2 is the maximum meaningful overlap.
         h_overlap = min(overlap, tile_h // 2)
         w_overlap = min(overlap, tile_w // 2)
 
