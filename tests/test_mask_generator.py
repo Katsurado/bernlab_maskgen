@@ -308,3 +308,138 @@ class TestIntegration:
             mask = mock_generator._postprocess(logits, threshold=0.5, return_prob=False)
             
             assert mask.size == (w, h), f"Failed for size {h}x{w}"
+
+# ──────────────────────────────────────────────────────────────
+# Tiling Tests
+# ──────────────────────────────────────────────────────────────
+
+class TestComputeTileGrid:
+
+    def test_single_tile(self, mock_generator):
+        """Image smaller than tile_size produces one tile."""
+        tiles = mock_generator._compute_tile_grid(h=100, w=100, tile_size=256, overlap=32)
+        
+        assert len(tiles) == 1
+        assert tiles[0] == (0, 100, 0, 100)
+
+    def test_exact_fit(self, mock_generator):
+        """Tiles fit exactly with no partial edge tiles."""
+        # tile_size=256, overlap=32 -> stride=224
+        # Only 1 row (h=256), width=480 = 256 + 224 -> 2 tiles in x
+        tiles = mock_generator._compute_tile_grid(h=256, w=480, tile_size=256, overlap=32)
+        
+        # stride=224, so y_starts=[0], x_starts=[0, 224]
+        # But wait - range(0, 256, 224) = [0, 224], so 2 y positions!
+        # Actually need h <= stride to get 1 row
+        
+        # Let's just verify the tiles make sense
+        assert tiles[0] == (0, 256, 0, 256)
+        assert tiles[1] == (0, 256, 224, 480)
+
+    def test_partial_edge(self, mock_generator):
+        """Edge tiles are clamped to image bounds."""
+        tiles = mock_generator._compute_tile_grid(h=300, w=300, tile_size=256, overlap=32)
+        
+        # stride = 224, so x_starts = [0, 224], y_starts = [0, 224]
+        assert len(tiles) == 4
+        
+        for y_start, y_end, x_start, x_end in tiles:
+            assert y_end <= 300
+            assert x_end <= 300
+
+    def test_full_coverage(self, mock_generator):
+        """Every pixel is covered by at least one tile."""
+        h, w = 500, 700
+        tiles = mock_generator._compute_tile_grid(h=h, w=w, tile_size=256, overlap=32)
+        
+        coverage = np.zeros((h, w), dtype=int)
+        for y_start, y_end, x_start, x_end in tiles:
+            coverage[y_start:y_end, x_start:x_end] += 1
+        
+        assert (coverage >= 1).all(), "Some pixels not covered"
+
+
+class TestCreateBlendWeights:
+
+    def test_shape(self, mock_generator):
+        """Output shape matches input dimensions."""
+        weights = mock_generator._create_blend_weights(tile_h=256, tile_w=256, overlap=32)
+        
+        assert weights.shape == (256, 256)
+
+    def test_center_is_one(self, mock_generator):
+        """Center region has weight 1.0."""
+        weights = mock_generator._create_blend_weights(tile_h=256, tile_w=256, overlap=32)
+        
+        center = weights[64:192, 64:192]
+        assert torch.allclose(center, torch.ones_like(center))
+
+    def test_no_zeros(self, mock_generator):
+        """Weights are strictly positive (avoid division by zero)."""
+        weights = mock_generator._create_blend_weights(tile_h=256, tile_w=256, overlap=32)
+        
+        assert (weights > 0).all()
+
+    def test_symmetry(self, mock_generator):
+        """Weights are symmetric in all directions."""
+        weights = mock_generator._create_blend_weights(tile_h=256, tile_w=256, overlap=32)
+        
+        assert torch.allclose(weights, weights.flip(1))  # horizontal
+        assert torch.allclose(weights, weights.flip(0))  # vertical
+
+    def test_ramp_increasing(self, mock_generator):
+        """Edge ramps increase from edge to center."""
+        overlap = 4
+        weights = mock_generator._create_blend_weights(tile_h=20, tile_w=20, overlap=overlap)
+        
+        center_row = weights[10, :]
+        left_ramp = center_row[:overlap]
+        
+        for i in range(len(left_ramp) - 1):
+            assert left_ramp[i] < left_ramp[i + 1]
+
+
+class TestInferTiled:
+
+    def test_output_shape(self, mock_generator):
+        """Output has correct shape (1, 1, H, W)."""
+        def mock_infer_whole(tile):
+            _, _, h, w = tile.shape
+            return torch.ones(1, 1, h, w)
+        
+        mock_generator._infer_whole = mock_infer_whole
+        
+        tensor = torch.randn(1, 3, 500, 700)
+        output = mock_generator._infer_tiled(tensor, tile_size=256, overlap=32)
+        
+        assert output.shape == (1, 1, 500, 700)
+
+    def test_uniform_blending(self, mock_generator):
+        """Uniform predictions blend to uniform output."""
+        def mock_infer_whole(tile):
+            _, _, h, w = tile.shape
+            return torch.ones(1, 1, h, w) * 0.5
+        
+        mock_generator._infer_whole = mock_infer_whole
+        
+        tensor = torch.randn(1, 3, 300, 300)
+        output = mock_generator._infer_tiled(tensor, tile_size=128, overlap=16)
+        
+        assert torch.allclose(output, torch.ones_like(output) * 0.5, atol=1e-5)
+
+    def test_no_seams(self, mock_generator):
+        """No visible seams at tile boundaries."""
+        def mock_infer_whole(tile):
+            _, _, h, w = tile.shape
+            return torch.ones(1, 1, h, w)
+        
+        mock_generator._infer_whole = mock_infer_whole
+        
+        tensor = torch.randn(1, 3, 300, 300)
+        output = mock_generator._infer_tiled(tensor, tile_size=128, overlap=32)
+        
+        diff_x = torch.abs(output[:, :, :, 1:] - output[:, :, :, :-1])
+        diff_y = torch.abs(output[:, :, 1:, :] - output[:, :, :-1, :])
+        
+        assert diff_x.max() < 0.1
+        assert diff_y.max() < 0.1

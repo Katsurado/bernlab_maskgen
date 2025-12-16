@@ -15,8 +15,9 @@ import torch._dynamo
 import torch.nn.functional as F
 import torch.optim.swa_utils as swa
 
-
 from PIL import Image
+from tqdm import tqdm
+
 
 # Internal imports
 from .model import Net
@@ -46,6 +47,7 @@ class MaskGenerator:
         "ema": 0.9999,
     }
 
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -73,6 +75,7 @@ class MaskGenerator:
         self.model.to(self.device, memory_format=torch.channels_last)  # move weights to correct device
         self.device = next(self.model.parameters()).device # move it to actual device i.e. mps0 instead of mps
         self.model.eval()            # disable dropout, stochastic depth, etc.
+
 
     def generate(
         self,
@@ -109,13 +112,18 @@ class MaskGenerator:
         
         if name == "whole":
             logits = self._infer_whole(tensor)
+
         elif name == "tile":
             tile_size = strategy.get("tile_size", 512)
             overlap = strategy.get("overlap", 64)
+            if overlap >= tile_size // 2:
+                raise ValueError(f"overlap ({overlap}) must be < tile_size // 2 ({tile_size // 2})")
             logits = self._infer_tiled(tensor, tile_size, overlap)
+
         elif name == "downsample":
             max_dim = strategy.get("max_dim", 1024)
             logits = self._infer_downsampled(tensor, max_dim)
+
         else:
             raise ValueError(f"Unknown strategy: {name}")
         
@@ -151,6 +159,7 @@ class MaskGenerator:
     ) -> torch.device:
         """Map device string to torch.device, handling 'auto'."""
         return torch.device(set_device()) if device == 'auto' else torch.device(device)
+
 
     def _preprocess(
         self, image: Union[str, Path, Image.Image, np.ndarray]
@@ -212,6 +221,7 @@ class MaskGenerator:
         tensor = tensor.to(self.device)
 
         return tensor
+
 
     def _postprocess(
         self,
@@ -292,6 +302,139 @@ class MaskGenerator:
         return logits
 
 
+    def _compute_tile_grid(
+        self,
+        h: int,
+        w: int,
+        tile_size: int,
+        overlap: int,
+    ) -> list[tuple[int, int, int, int]]:
+        """
+        Generate tile coordinates covering entire image.
+        
+        Args:
+            h, w: Image dimensions in pixels.
+            tile_size: Nominal tile size. Actual edge tiles may be smaller.
+            overlap: Pixels shared between adjacent tiles.
+        
+        Returns:
+            List of (y_start, y_end, x_start, x_end) tuples.
+            Coordinates are pixel indices for slicing: tensor[:, :, y_start:y_end, x_start:x_end]
+        
+        Algorithm:
+            Stride (step between tile starts):
+                stride = tile_size - overlap
+            
+            Tile positions along one axis (e.g., x):
+                x_start = 0, stride, 2*stride, 3*stride, ...
+                x_end   = min(x_start + tile_size, w)
+            
+            Stop when x_end reaches w (image boundary).
+            Repeat for y axis.
+        
+        Example (1D, w=1000, tile_size=256, overlap=32):
+            stride = 256 - 32 = 224
+            
+            Tile 0: x_start=0,   x_end=256   (size 256)
+            Tile 1: x_start=224, x_end=480   (size 256)
+            Tile 2: x_start=448, x_end=704   (size 256)
+            Tile 3: x_start=672, x_end=928   (size 256)
+            Tile 4: x_start=896, x_end=1000  (size 104, edge tile)
+        
+        Guarantees:
+            - Full coverage (no gaps)
+            - Edge tiles clamped to image bounds
+            - At least one tile even if image < tile_size
+        """
+
+        result = []
+        stride = tile_size - overlap
+        for y_start in range(0, h, stride):
+            for x_start in range(0, w,stride):
+                x_end = min(x_start + tile_size, w)
+                y_end = min(y_start + tile_size, h)
+                result.append((y_start, y_end, x_start, x_end))
+
+        return result
+    
+
+    def _create_blend_weights(
+        self,
+        tile_h: int,
+        tile_w: int,
+        overlap: int,
+    ) -> torch.Tensor:
+        """
+        Create 2D blend weights with linear ramps at edges.
+        
+        Used to smoothly blend overlapping tiles. Pixels near tile edges
+        get lower weights so adjacent tiles can contribute.
+        
+        Args:
+            tile_h, tile_w: Actual tile dimensions (may be smaller for edge tiles).
+            overlap: Ramp width in pixels. Weights ramp from 0 to 1 over this distance.
+        
+        Returns:
+            Tensor of shape (tile_h, tile_w), values in (0, 1].
+            Center region = 1.0, edges ramp down linearly.
+        
+        Algorithm:
+            1D weight for length L with overlap O:
+                - Positions 0 to O-1: ramp up from ~0 to ~1
+                - Positions O to L-O-1: plateau at 1.0
+                - Positions L-O to L-1: ramp down from ~1 to ~0
+            
+            Formula for position i:
+                if i < O:           weight = (i + 1) / (O + 1)
+                elif i >= L - O:    weight = (L - i) / (O + 1)
+                else:               weight = 1.0
+            
+            2D weights = outer product of 1D weights:
+                weights_2d[y, x] = weights_y[y] * weights_x[x]
+        
+        Example (1D, length=10, overlap=3):
+            Position:  0     1     2     3     4     5     6     7     8     9
+            Weight:    0.25  0.50  0.75  1.0   1.0   1.0   1.0   0.75  0.50  0.25
+                       |---- ramp up ---|------plateau------|---- ramp down ---|
+        
+        Example (2D, 6x6 tile, overlap=2):
+            0.06  0.12  0.17  0.17  0.12  0.06
+            0.12  0.25  0.33  0.33  0.25  0.12
+            0.17  0.33  0.44  0.44  0.33  0.17
+            0.17  0.33  0.44  0.44  0.33  0.17
+            0.12  0.25  0.33  0.33  0.25  0.12
+            0.06  0.12  0.17  0.17  0.12  0.06
+            
+            Center has highest weight, corners have lowest.
+        
+        Note:
+            Edge tiles (at image boundary) still get ramps on all sides.
+            This is fine because we normalize by weight_sum in _infer_tiled —
+            edge pixels just have less total weight, but the ratio is correct.
+        """
+        
+        h_weights = np.ones((tile_h, ))
+        w_weights = np.ones((tile_w, ))
+        
+        h_overlap = min(overlap, tile_h // 2)
+        w_overlap = min(overlap, tile_w // 2)
+
+        # note ramping are symmetric and identical on h and w 
+        if h_overlap > 0:
+            ramp = (np.arange(h_overlap) + 1) / (h_overlap + 1)
+            h_weights[:h_overlap] = ramp
+            h_weights[-h_overlap:] = ramp[::-1]
+        
+        if w_overlap > 0:
+            ramp = (np.arange(w_overlap) + 1) / (w_overlap + 1)
+            w_weights[:w_overlap] = ramp
+            w_weights[-w_overlap:] = ramp[::-1]
+
+        tile_weights = np.outer(h_weights, w_weights)
+        tile_weights = torch.from_numpy(tile_weights).float()
+        return tile_weights
+
+
     def _infer_tiled(
         self, tensor: torch.Tensor,
         tile_size: int,
@@ -347,7 +490,30 @@ class MaskGenerator:
             >>> logits.shape
             torch.Size([1, 1, 4000, 6000])
         """
-        raise NotImplementedError
+        _, _, h, w = tensor.shape
+
+        output = torch.zeros(1, 1, h, w)
+        weight_sum = torch.zeros(1, 1, h, w)
+
+        tile_positions = self._compute_tile_grid(h, w, tile_size, overlap)
+        print(f"Tiling: {len(tile_positions)} tiles ({tile_size}x{tile_size}, overlap={overlap})")
+
+
+        for position in tqdm(tile_positions, desc="Inference", unit="tile"):
+            y_start, y_end, x_start, x_end = position
+            tile = tensor[:, :, y_start:y_end, x_start:x_end]
+            tile_logits = self._infer_whole(tile)
+            
+            tile_h, tile_w = y_end - y_start, x_end - x_start
+            tile_weights = self._create_blend_weights(tile_h, tile_w, overlap)
+
+            tile_logits = tile_logits * tile_weights
+            output[:, :, y_start:y_end, x_start:x_end] += tile_logits
+            weight_sum[:, :, y_start:y_end, x_start:x_end] += tile_weights
+
+        output = output / weight_sum.clamp(min=1e-8)
+        return output
+
 
     def _infer_downsampled(
         self, tensor: torch.Tensor,
@@ -394,13 +560,23 @@ class MaskGenerator:
         # Downsample
         new_h = int(h * scale)
         new_w = int(w * scale)
-        small = F.interpolate(tensor.cpu(), size=(new_h, new_w), mode='bilinear', align_corners=False).to(self.device)
+        small = F.interpolate(
+            tensor, 
+            size=(new_h, new_w), 
+            mode='bilinear', 
+            align_corners=False
+        )
 
         # Infer (pad/unpad handled inside)
         logits_small = self._infer_whole(small)
 
         # Upsample back to original size
-        logits = F.interpolate(logits_small, size=original_size, mode='bilinear', align_corners=False)
+        logits = F.interpolate(
+            logits_small, 
+            size=original_size, 
+            mode='bilinear', 
+            align_corners=False
+        )
     
         return logits   
 
