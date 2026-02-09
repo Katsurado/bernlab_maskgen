@@ -76,7 +76,7 @@ from maskgen import MaskGenerator, download_weights
 
 gen = MaskGenerator(download_weights())
 gen.generate_and_save(
-    "path/to/first_image.tif",
+    "path/to/first_image.png",
     "path/to/masks/mask.png",
     strategy={"name": "tile", "tile_size": 512, "overlap": 64},
 )
