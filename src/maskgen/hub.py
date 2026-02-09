@@ -16,9 +16,7 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
-# Default URL — update <user> and tag as needed after first release:
-#   gh release create v0.1.0 model/best.pth --title "v0.1.0" --notes "Initial release"
-DEFAULT_URL = "https://github.com/<user>/maskgen/releases/latest/download/best.pth"
+DEFAULT_URL = "https://github.com/Katsurado/bernlab_maskgen/releases/latest/download/best.pth"
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "maskgen"
 
 
