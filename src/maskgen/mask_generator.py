@@ -514,7 +514,7 @@ class MaskGenerator:
         for position in tqdm(tile_positions, desc="Inference", unit="tile"):
             y_start, y_end, x_start, x_end = position
             tile = tensor[:, :, y_start:y_end, x_start:x_end]
-            tile_logits = self._infer_whole(tile)
+            tile_logits = self._infer_whole(tile).cpu()
 
             tile_h, tile_w = y_end - y_start, x_end - x_start
             tile_weights = self._create_blend_weights(tile_h, tile_w, overlap)

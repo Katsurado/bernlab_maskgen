@@ -439,3 +439,39 @@ class TestInferTiled:
 
         assert diff_x.max() < 0.1
         assert diff_y.max() < 0.1
+
+    def test_tiled_output_on_cpu(self, mock_generator):
+        """Tiled inference output should always be on CPU."""
+        def mock_infer_whole(tile):
+            _, _, h, w = tile.shape
+            return torch.ones(1, 1, h, w)
+
+        mock_generator._infer_whole = mock_infer_whole
+
+        tensor = torch.randn(1, 3, 300, 300)
+        output = mock_generator._infer_tiled(tensor, tile_size=128, overlap=16)
+
+        assert output.device == torch.device("cpu"), (
+            "Tiled output must be on CPU. If _infer_whole returns GPU tensors, "
+            "they must be moved to CPU before accumulation."
+        )
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() and not torch.backends.mps.is_available(),
+        reason="No GPU available",
+    )
+    def test_tiled_gpu_to_cpu(self, mock_generator):
+        """Tiled inference handles GPU->CPU transfer for accumulation."""
+        device = "cuda" if torch.cuda.is_available() else "mps"
+
+        def mock_infer_whole(tile):
+            _, _, h, w = tile.shape
+            return torch.ones(1, 1, h, w, device=device)
+
+        mock_generator._infer_whole = mock_infer_whole
+
+        tensor = torch.randn(1, 3, 300, 300)
+        output = mock_generator._infer_tiled(tensor, tile_size=128, overlap=16)
+
+        assert output.device == torch.device("cpu")
+        assert output.shape == (1, 1, 300, 300)
