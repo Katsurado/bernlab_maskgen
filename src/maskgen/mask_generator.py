@@ -5,33 +5,31 @@ Inference wrapper for semantic segmentation model.
 Handles large images via tiling or downsampling to enable CPU inference.
 """
 from __future__ import annotations
-from typing import Literal, Union
+
+import math
 from pathlib import Path
+from typing import Literal, Union
 
 import numpy as np
 import torch
-import math
 import torch._dynamo
 import torch.nn.functional as F
 import torch.optim.swa_utils as swa
-
 from PIL import Image
 from tqdm import tqdm
 
-
 # Internal imports
 from .model import Net
-from .utils import set_device, load_model
-
+from .utils import load_model, set_device
 
 
 class MaskGenerator:
     """
     High-level interface for generating binary masks from images.
-    
+
     Abstracts away model loading, device management, and memory-efficient
     inference strategies (tiling or downsampling) for large images.
-    
+
     Example:
         >>> gen = MaskGenerator("checkpoint.pth")
         >>> mask = gen.generate("photo.jpg")
@@ -66,7 +64,7 @@ class MaskGenerator:
         self.device:torch.device = self._resolve_device(device)
 
         # MPS + torch.compile has bugs with certain tensor sizes
-        # Disable dynamo to avoid InductorError on large images 
+        # Disable dynamo to avoid InductorError on large images
         if self.device.type == "mps":
             torch._dynamo.config.suppress_errors = True
             torch._dynamo.disable()
@@ -90,7 +88,7 @@ class MaskGenerator:
         Args:
             image: Input RGB image (path, PIL Image, or HWC uint8 array).
             strategy: Inference strategy config. Dict with 'name' key and strategy-specific params.
-                - {"name": "whole"} 
+                - {"name": "whole"}
                     No processing, infer on original image. Requires lots of VRAM.
                 - {"name": "tile", "tile_size": 512, "overlap": 64}
                     Process in overlapping patches, blend results.
@@ -105,11 +103,11 @@ class MaskGenerator:
         """
         if strategy is None:
             strategy = {"name": "whole"}
-        
+
         name = strategy['name']
 
         tensor = self._preprocess(image)
-        
+
         if name == "whole":
             logits = self._infer_whole(tensor)
 
@@ -126,11 +124,24 @@ class MaskGenerator:
 
         else:
             raise ValueError(f"Unknown strategy: {name}")
-        
+
         mask = self._postprocess(logits, threshold, return_prob)
 
         return mask
-    
+
+    def generate_and_save(
+        self,
+        image: Union[str, Path, Image.Image, np.ndarray],
+        output_path: Union[str, Path],
+        strategy: Union[dict, None] = None,
+        threshold: float = 0.5,
+    ) -> Image.Image:
+        """Generate mask and save to disk. Returns the mask."""
+        mask = self.generate(image, strategy=strategy, threshold=threshold)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        mask.save(output_path)
+        return mask
+
     # ──────────────────────────────────────────────────────────────
     # Private helpers
     # ──────────────────────────────────────────────────────────────
@@ -177,7 +188,7 @@ class MaskGenerator:
                 - np.ndarray: HWC uint8 array with shape (H, W, 3), values in [0, 255]
 
         Returns:
-            - tensor: torch.Tensor of shape (1, 3, H, W), dtype float32, 
+            - tensor: torch.Tensor of shape (1, 3, H, W), dtype float32,
                     values in [0, 255], on self.device
         Raises:
             FileNotFoundError: If path doesn't exist
@@ -266,7 +277,7 @@ class MaskGenerator:
 
         if return_prob:
             return probs
-        
+
         # apply a threshold
         mask = (probs >= threshold).astype(np.uint8)
 
@@ -279,8 +290,8 @@ class MaskGenerator:
         self, tensor: torch.Tensor
     ) -> torch.Tensor:
         """
-        Run single forward pass on entire image. 
-        
+        Run single forward pass on entire image.
+
         WARNING: For large images this will need A LOT of VRAM.
         In general, avoid whole image inference unless on NVIDIA A100 80G or larger GPUs.
 
@@ -298,7 +309,7 @@ class MaskGenerator:
             logits_padded = self.model(padded)
 
         logits = self._unpad(logits_padded, pad_spec)
-            
+
         return logits
 
 
@@ -311,36 +322,36 @@ class MaskGenerator:
     ) -> list[tuple[int, int, int, int]]:
         """
         Generate tile coordinates covering entire image.
-        
+
         Args:
             h, w: Image dimensions in pixels.
             tile_size: Nominal tile size. Actual edge tiles may be smaller.
             overlap: Pixels shared between adjacent tiles.
-        
+
         Returns:
             List of (y_start, y_end, x_start, x_end) tuples.
             Coordinates are pixel indices for slicing: tensor[:, :, y_start:y_end, x_start:x_end]
-        
+
         Algorithm:
             Stride (step between tile starts):
                 stride = tile_size - overlap
-            
+
             Tile positions along one axis (e.g., x):
                 x_start = 0, stride, 2*stride, 3*stride, ...
                 x_end   = min(x_start + tile_size, w)
-            
+
             Stop when x_end reaches w (image boundary).
             Repeat for y axis.
-        
+
         Example (1D, w=1000, tile_size=256, overlap=32):
             stride = 256 - 32 = 224
-            
+
             Tile 0: x_start=0,   x_end=256   (size 256)
             Tile 1: x_start=224, x_end=480   (size 256)
             Tile 2: x_start=448, x_end=704   (size 256)
             Tile 3: x_start=672, x_end=928   (size 256)
             Tile 4: x_start=896, x_end=1000  (size 104, edge tile)
-        
+
         Guarantees:
             - Full coverage (no gaps)
             - Edge tiles clamped to image bounds
@@ -356,7 +367,7 @@ class MaskGenerator:
                 result.append((y_start, y_end, x_start, x_end))
 
         return result
-    
+
 
     def _create_blend_weights(
         self,
@@ -366,37 +377,37 @@ class MaskGenerator:
     ) -> torch.Tensor:
         """
         Create 2D blend weights with linear ramps at edges.
-        
+
         Used to smoothly blend overlapping tiles. Pixels near tile edges
         get lower weights so adjacent tiles can contribute.
-        
+
         Args:
             tile_h, tile_w: Actual tile dimensions (may be smaller for edge tiles).
             overlap: Ramp width in pixels. Weights ramp from 0 to 1 over this distance.
-        
+
         Returns:
             Tensor of shape (tile_h, tile_w), values in (0, 1].
             Center region = 1.0, edges ramp down linearly.
-        
+
         Algorithm:
             1D weight for length L with overlap O:
                 - Positions 0 to O-1: ramp up from ~0 to ~1
                 - Positions O to L-O-1: plateau at 1.0
                 - Positions L-O to L-1: ramp down from ~1 to ~0
-            
+
             Formula for position i:
                 if i < O:           weight = (i + 1) / (O + 1)
                 elif i >= L - O:    weight = (L - i) / (O + 1)
                 else:               weight = 1.0
-            
+
             2D weights = outer product of 1D weights:
                 weights_2d[y, x] = weights_y[y] * weights_x[x]
-        
+
         Example (1D, length=10, overlap=3):
             Position:  0     1     2     3     4     5     6     7     8     9
             Weight:    0.25  0.50  0.75  1.0   1.0   1.0   1.0   0.75  0.50  0.25
                        |---- ramp up ---|------plateau------|---- ramp down ---|
-        
+
         Example (2D, 6x6 tile, overlap=2):
             0.06  0.12  0.17  0.17  0.12  0.06
             0.12  0.25  0.33  0.33  0.25  0.12
@@ -404,28 +415,28 @@ class MaskGenerator:
             0.17  0.33  0.44  0.44  0.33  0.17
             0.12  0.25  0.33  0.33  0.25  0.12
             0.06  0.12  0.17  0.17  0.12  0.06
-            
+
             Center has highest weight, corners have lowest.
-        
+
         Note:
             Edge tiles (at image boundary) still get ramps on all sides.
             This is fine because we normalize by weight_sum in _infer_tiled —
             edge pixels just have less total weight, but the ratio is correct.
         """
-        
+
         h_weights = np.ones((tile_h, ))
         w_weights = np.ones((tile_w, ))
-        
+
         # tile_size / 2 is the maximum meaningful overlap.
         h_overlap = min(overlap, tile_h // 2)
         w_overlap = min(overlap, tile_w // 2)
 
-        # note ramping are symmetric and identical on h and w 
+        # note ramping are symmetric and identical on h and w
         if h_overlap > 0:
             ramp = (np.arange(h_overlap) + 1) / (h_overlap + 1)
             h_weights[:h_overlap] = ramp
             h_weights[-h_overlap:] = ramp[::-1]
-        
+
         if w_overlap > 0:
             ramp = (np.arange(w_overlap) + 1) / (w_overlap + 1)
             w_weights[:w_overlap] = ramp
@@ -504,7 +515,7 @@ class MaskGenerator:
             y_start, y_end, x_start, x_end = position
             tile = tensor[:, :, y_start:y_end, x_start:x_end]
             tile_logits = self._infer_whole(tile)
-            
+
             tile_h, tile_w = y_end - y_start, x_end - x_start
             tile_weights = self._create_blend_weights(tile_h, tile_w, overlap)
 
@@ -554,17 +565,17 @@ class MaskGenerator:
         original_size = (h, w)
 
         scale = max_dim / max(h, w)
-    
+
         if scale >= 1.0:
             return self._infer_whole(tensor)
-        
+
         # Downsample
         new_h = int(h * scale)
         new_w = int(w * scale)
         small = F.interpolate(
-            tensor, 
-            size=(new_h, new_w), 
-            mode='bilinear', 
+            tensor,
+            size=(new_h, new_w),
+            mode='bilinear',
             align_corners=False
         )
 
@@ -573,13 +584,13 @@ class MaskGenerator:
 
         # Upsample back to original size
         logits = F.interpolate(
-            logits_small, 
-            size=original_size, 
-            mode='bilinear', 
+            logits_small,
+            size=original_size,
+            mode='bilinear',
             align_corners=False
         )
-    
-        return logits   
+
+        return logits
 
     @staticmethod
     def _pad_to_multiple(
@@ -666,9 +677,9 @@ class MaskGenerator:
                 tensor[:, :, 0:-0, :]  # Wrong! -0 == 0, returns empty tensor
                 tensor[:, :, 0:None, :]  # Correct! None means "to the end"
         """
-        
+
         left, right, top, bottom = pad_spec
-        
+
         tensor = tensor[
             :,
             :,
@@ -677,7 +688,7 @@ class MaskGenerator:
         ]
 
         return tensor
-    
+
     def _validate_inference_input(
         self, tensor: torch.Tensor
     ) -> None:

@@ -1,17 +1,12 @@
-import numpy as np
 import torch
 import torchvision
 import torchvision.transforms.v2 as T
-import torch.nn.functional as F
-
-import matplotlib.pyplot as plt
-
-from PIL import Image
+from torch.utils.data import Dataset
 from torchvision import tv_tensors
-from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
 from .utils import list_dir
+
 
 class ImageData(Dataset):
     @staticmethod
@@ -27,7 +22,7 @@ class ImageData(Dataset):
             T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
         ])
         return geom, norm
-    
+
     def __init__(self, root:str, partiton:str, transform:bool, config:dict) -> None:
         '''
         Custom dataset class for image and mask data
@@ -51,7 +46,7 @@ class ImageData(Dataset):
         mask_names = sorted(list_dir(self.mask_path))
 
         assert(len(img_names) == len(mask_names))
-        
+
         self.num_raw_img = len(img_names)
 
         for i in tqdm(range(self.num_raw_img)):
@@ -66,7 +61,7 @@ class ImageData(Dataset):
 
     def __len__(self):
         return self.crops_per_img * self.num_raw_img
-    
+
     def __getitem__(self, index):
         raw_idx = index // self.crops_per_img
 
@@ -89,4 +84,4 @@ class ImageData(Dataset):
         mask_crop = (mc > 127).to(torch.float32)  # swap to <128 if your foreground is dark
 
 
-        return img_crop, mask_crop     
+        return img_crop, mask_crop

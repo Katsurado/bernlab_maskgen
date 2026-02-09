@@ -1,5 +1,6 @@
 import torch
 
+
 class GlobalResponseNorm(torch.nn.Module):
     def __init__(self, channels, beta=0.0, gamma=0.0):
         super().__init__()
@@ -14,7 +15,7 @@ class GlobalResponseNorm(torch.nn.Module):
         gx = torch.norm(x, p=2, dim=(2,3), keepdim=True)
         nx = gx / (gx.mean(dim=1, keepdim=True)+1e-6)
         return g * (x * nx) + b + x
-    
+
 
 class Stochastic_Depth(torch.nn.Module):
     def __init__(self, p):
@@ -32,7 +33,7 @@ class Stochastic_Depth(torch.nn.Module):
 
     def __repr__(self):
         return f"Stochastic_Depth(p = {self.p})"
-    
+
 class ConvNextV2_Block(torch.nn.Module):
     def __init__(self, channels, depth, config):
         super().__init__()
@@ -81,7 +82,7 @@ class UpSample_Block(torch.nn.Module):
 
     def forward(self, x):
         return self.block(x)
-    
+
 
 class Encoder(torch.nn.Module):
     def __init__(self, channels, config) -> None:
@@ -93,22 +94,22 @@ class Encoder(torch.nn.Module):
         )
 
         stage1 = [
-            ConvNextV2_Block(channels, i+1, config) 
+            ConvNextV2_Block(channels, i+1, config)
             for i in range(config['layers'][0])
         ]
 
         stage2 = [
-            ConvNextV2_Block(channels*2, i+1+sum(config['layers'][:1]), config) 
+            ConvNextV2_Block(channels*2, i+1+sum(config['layers'][:1]), config)
             for i in range(config['layers'][1])
         ]
 
         stage3 = [
-            ConvNextV2_Block(channels*4, i+1+sum(config['layers'][:2]), config) 
+            ConvNextV2_Block(channels*4, i+1+sum(config['layers'][:2]), config)
             for i in range(config['layers'][2])
         ]
 
         stage4 = [
-            ConvNextV2_Block(channels*8, i+1+sum(config['layers'][:3]), config) 
+            ConvNextV2_Block(channels*8, i+1+sum(config['layers'][:3]), config)
             for i in range(config['layers'][3])
         ]
 
@@ -133,7 +134,7 @@ class Encoder(torch.nn.Module):
 
         return [stage_1_out, stage_2_out, stage_3_out, stage_4_out]
 
-        
+
 class Decoder(torch.nn.Module):
     def __init__(self, channels, config) -> None:
         super().__init__()
@@ -189,4 +190,4 @@ class Net(torch.nn.Module):
         encoder_outs = self.encoder(x)
         mask = self.decoder(encoder_outs)
         return mask
-    
+

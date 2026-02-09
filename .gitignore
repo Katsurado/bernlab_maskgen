@@ -1,2 +1,24 @@
 *__pycache__*
 .DS_Store
+
+# Data & artifacts
+data/
+model/
+chechpoints/
+checkpoints/
+stuf/
+wandb/
+src/wandb/
+src/config.json
+src/*.ipynb
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+
+# Ruff
+.ruff_cache/

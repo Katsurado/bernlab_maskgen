@@ -1,30 +1,30 @@
 import argparse
-import numpy as np
-import torch
-import maskgen.model as m
-import torch.optim as optim
-import torch.amp as amp
-import json
-import torch.optim.swa_utils as swa
-import wandb
 import gc
+import json
 
+import torch
+import torch.amp as amp
+import torch.optim as optim
+import torch.optim.swa_utils as swa
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
+from torchinfo import summary
+from tqdm.auto import tqdm
+
+import maskgen.model as m
+import wandb
 from maskgen.data import ImageData
 from maskgen.utils import *
-from tqdm.auto import tqdm
-from torchinfo import summary
 
 
-def train_epoch(model:torch.nn.Module, 
-                ema_model:optim.swa_utils.AveragedModel, 
-                criterion:torch.nn.Module, 
-                dataloader:DataLoader, 
-                optimizer:optim.Optimizer, 
-                scheduler:lr_scheduler.LRScheduler, 
-                scaler:amp.grad_scaler.GradScaler, 
-                device:str, 
+def train_epoch(model:torch.nn.Module,
+                ema_model:optim.swa_utils.AveragedModel,
+                criterion:torch.nn.Module,
+                dataloader:DataLoader,
+                optimizer:optim.Optimizer,
+                scheduler:lr_scheduler.LRScheduler,
+                scaler:amp.grad_scaler.GradScaler,
+                device:str,
                 config:dict) -> float:
     '''
     train one epoch
@@ -68,9 +68,9 @@ def train_epoch(model:torch.nn.Module,
     return train_loss
 
 @torch.no_grad()
-def validate(model:optim.swa_utils.AveragedModel, 
-             criterion:torch.nn.Module, 
-             dataloader:DataLoader, 
+def validate(model:optim.swa_utils.AveragedModel,
+             criterion:torch.nn.Module,
+             dataloader:DataLoader,
              device:str)->float:
     '''
     compute val loss
@@ -95,7 +95,7 @@ def validate(model:optim.swa_utils.AveragedModel,
 
         val_loss = loss.item()
         batch_bar.update()
-    
+
     batch_bar.close()
 
     return val_loss
@@ -130,7 +130,7 @@ def train():
     train_loader = DataLoader(train_dataset, config['batch_size'], shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val_dataset, config['batch_size'], shuffle=False, num_workers=8, pin_memory=True)
     test_loader = DataLoader(test_dataset, config['batch_size'], shuffle=False, num_workers=8, pin_memory=True)
-    
+
     # define models
     model = m.Net(NUM_CHANNELS, config)
     model = model.to(device=device, memory_format=torch.channels_last)
@@ -147,7 +147,7 @@ def train():
     criterion = torch.nn.BCEWithLogitsLoss()
 
     optimizer = optim.AdamW(params, lr=config['lr'])
-    
+
     warmup = lr_scheduler.LinearLR(optimizer, total_iters=config["warmup_epoch"])
     cosine = lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['scheduler_params']['T-max'])
 
@@ -180,7 +180,7 @@ def train():
 
     for epoch in range(e,  config['epochs']):
         print("\nEpoch {}/{}".format(epoch+1, config['epochs']))
-        train_loss = train_epoch(model, ema_model, criterion, train_loader, 
+        train_loss = train_epoch(model, ema_model, criterion, train_loader,
                                  optimizer, scheduler, scaler, device, config)
         curr_lr = float(optimizer.param_groups[0]['lr'])
         print("\nEpoch {}/{}: Train Loss {:.04f}\t Learning Rate {:.04f}"
