@@ -4,7 +4,7 @@ mask_generator.py
 Inference wrapper for semantic segmentation model.
 Handles large images via tiling or downsampling to enable CPU inference.
 """
-
+from __future__ import annotations
 from typing import Literal, Union
 from pathlib import Path
 
