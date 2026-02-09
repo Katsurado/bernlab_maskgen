@@ -28,7 +28,7 @@ pip install "maskgen[dev] @ git+https://github.com/Katsurado/bernlab_maskgen.git
 from maskgen import MaskGenerator, download_weights
 
 gen = MaskGenerator(download_weights())
-mask = gen.generate("image.tif", strategy={"name": "tile", "tile_size": 512, "overlap": 64})
+mask = gen.generate("image.png", strategy={"name": "tile", "tile_size": 512, "overlap": 64})
 mask.save("mask.png")
 ```
 
@@ -86,25 +86,13 @@ The mask is saved to disk and picked up by the existing `Experiment` config as u
 
 ## API Reference
 
-### `MaskGenerator(checkpoint_path, device="auto", use_ema=True, config=None)`
-
-Load model from a `.pth` checkpoint. `device` can be `"auto"`, `"cpu"`, `"cuda"`, or `"mps"`.
-
-### `MaskGenerator.generate(image, strategy=None, threshold=0.5, return_prob=False)`
-
-Generate a binary mask from an image. `image` accepts a file path, PIL Image, or HWC uint8 numpy array. Returns a PIL Image (mode `"L"`) or float32 numpy array if `return_prob=True`.
-
-### `MaskGenerator.generate_and_save(image, output_path, strategy=None, threshold=0.5)`
-
-Generate a mask and save it to `output_path`. Creates parent directories if needed. Returns the mask.
-
-### `download_weights(url=DEFAULT_URL, cache_dir="~/.cache/maskgen", filename="best.pth", force=False)`
-
-Download model weights from GitHub Releases. Caches locally and skips re-download unless `force=True`. Returns the path to the downloaded file.
-
-### `train(config, checkpoint_dir, data_root, resume_from=None, use_wandb=True)`
-
-Train the model. See [Training](#training) for the config dict format.
+| Function | Description |
+|----------|-------------|
+| `MaskGenerator(checkpoint_path, device, use_ema, config)` | Load model from a `.pth` checkpoint. `device`: `"auto"` (default), `"cpu"`, `"cuda"`, `"mps"`. |
+| `gen.generate(image, strategy, threshold, return_prob)` | Generate a binary mask. `image` accepts a path, PIL Image, or HWC uint8 numpy array. Returns PIL Image (mode `"L"`) or float32 ndarray if `return_prob=True`. |
+| `gen.generate_and_save(image, output_path, strategy, threshold)` | Generate mask and save to `output_path`. Creates parent dirs. Returns the mask. |
+| `download_weights(url, cache_dir, filename, force)` | Download weights from GitHub Releases to `~/.cache/maskgen/`. Skips if cached unless `force=True`. |
+| `train(config, checkpoint_dir, data_root, resume_from, use_wandb)` | Train the model. See [Training](#training) for the config dict format. |
 
 ## Development
 
